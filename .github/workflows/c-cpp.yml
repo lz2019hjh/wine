@@ -1,0 +1,15 @@
+name: "Wine on macOS"
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - name: configure
+      run: ./configure --enable-win64
+    - name: make
+      run: make
