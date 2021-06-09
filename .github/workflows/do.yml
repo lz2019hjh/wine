@@ -17,12 +17,10 @@ jobs:
       #     # brew install tree
       #     # tree $GITHUB_WORKSPACE
       #     ls $GITHUB_WORKSPACE
-      - name: mkdir
-        run: mkdir $GITHUB_WORKSPACE/build
-      - name: cd
-        run: cd $GITHUB_WORKSPACE/build
+      # - name: cd
+      #   run: cd $GITHUB_WORKSPACE/build
       - name: configure
-        run: ../configure --enable-win64
+        run: ../wine/wine/configure --enable-win64
 
       # Runs a set of commands using the runners shell
       - name: build
