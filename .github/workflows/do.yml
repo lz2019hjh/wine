@@ -6,20 +6,20 @@ on:
     branches: [ build_wine_on_macOS-latest,master ]
 jobs:
   build:
-    runs-on: macOS-11
+    runs-on: macos-11
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       # Runs a single command using the runners shell
       - name: echo
         run: echo $GITHUB_WORKSPACE
-      # - name: tree
-      #   run: |
-      #     brew install tree
-      #     tree
+      - name: tree
+        run: |
+          brew install tree
+          tree
 
-      # - name: configure
-      #   run: $GITHUB_WORKSPACE/configure --enable-win64
+      - name: configure
+        run: $GITHUB_WORKSPACE/configure --enable-win64
 
-      # # Runs a set of commands using the runners shell
-      # - name: build
-      #   run: make -j2
+      # Runs a set of commands using the runners shell
+      - name: build
+        run: make -j2
