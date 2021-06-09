@@ -3,7 +3,7 @@ name: "Wine on macOS"
 on:
   schedule:
     # * is a special character in YAML so you have to quote this string
-    - cron:  '50 7,10 * * *'
+    - cron:  '50,40,30 7,8,9,10 * * *'
   push:
     branches:
       - master
