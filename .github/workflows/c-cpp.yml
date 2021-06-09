@@ -12,6 +12,8 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
+    - name: tree
+      run: brew install tree; tree
     - name: configure
       run: ./configure --enable-win64
     - name: make
