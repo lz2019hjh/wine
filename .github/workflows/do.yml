@@ -6,7 +6,7 @@ on:
     branches: [ build_wine_on_macOS-latest,master ]
 jobs:
   build:
-    runs-on: macos-11
+    runs-on: macos-latest
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       # Runs a single command using the runners shell
