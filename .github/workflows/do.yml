@@ -15,7 +15,7 @@ jobs:
       - name: tree
         run: |
           brew install tree
-          tree
+          tree $GITHUB_WORKSPACE
 
       - name: configure
         run: $GITHUB_WORKSPACE/configure --enable-win64
