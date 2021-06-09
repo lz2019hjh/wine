@@ -12,15 +12,18 @@ jobs:
       # Runs a single command using the runners shell
       - name: echo
         run: echo $GITHUB_WORKSPACE
-      - name: tree
-        run: |
-          # brew install tree
-          # tree $GITHUB_WORKSPACE
-          ls $GITHUB_WORKSPACE
+      # - name: tree
+      #   run: |
+      #     # brew install tree
+      #     # tree $GITHUB_WORKSPACE
+      #     ls $GITHUB_WORKSPACE
+      - name: mkdir
+        run: mkdir $GITHUB_WORKSPACE/build
+      - name: cd
+        run: cd $GITHUB_WORKSPACE/build
+      - name: configure
+        run: ../configure --enable-win64
 
-      # - name: configure
-      #   run: $GITHUB_WORKSPACE/configure --enable-win64
-
-      # # Runs a set of commands using the runners shell
-      # - name: build
-      #   run: make -j2
+      # Runs a set of commands using the runners shell
+      - name: build
+        run: make -j2
