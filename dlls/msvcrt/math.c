@@ -1254,7 +1254,7 @@ float CDECL logf( float x )
     if (ix - 0x00800000 >= 0x7f800000 - 0x00800000) {
         /* x < 0x1p-126 or inf or nan. */
         if (ix * 2 == 0)
-            return math_error(_SING, "logf", x, 0, -1.0 / x);
+            return math_error(_SING, "logf", x, 0, (ix & 0x80000000 ? 1.0 : -1.0) / x);
         if (ix == 0x7f800000) /* log(inf) == inf. */
             return x;
         if (ix * 2 > 0xff000000)
@@ -1273,7 +1273,7 @@ float CDECL logf( float x )
     tmp = ix - 0x3f330000;
     i = (tmp >> (23 - 4)) % (1 << 4);
     k = (INT32)tmp >> 23; /* arithmetic shift */
-    iz = ix - (tmp & 0xff << 23);
+    iz = ix - (tmp & (0x1ffu << 23));
     invc = T[i].invc;
     logc = T[i].logc;
     z = *(float*)&iz;
@@ -2966,7 +2966,7 @@ double CDECL log( double x )
     if (top - 0x0010 >= 0x7ff0 - 0x0010) {
         /* x < 0x1p-1022 or inf or nan. */
         if (ix * 2 == 0)
-            return math_error(_SING, "log", x, 0, -1.0 / x);
+            return math_error(_SING, "log", x, 0, (top & 0x8000 ? 1.0 : -1.0) / x);
         if (ix == 0x7ff0000000000000ULL) /* log(inf) == inf. */
             return x;
         if ((top & 0x7ff0) == 0x7ff0 && (ix & 0xfffffffffffffULL))
@@ -4127,14 +4127,43 @@ double CDECL fma( double x, double y, double z )
 
 /*********************************************************************
  *      fmaf (MSVCRT.@)
+ *
+ * Copied from musl: src/math/fmaf.c
  */
 float CDECL fmaf( float x, float y, float z )
 {
-  float w = unix_funcs->fmaf(x, y, z);
-  if ((isinf(x) && y == 0) || (x == 0 && isinf(y))) *_errno() = EDOM;
-  else if (isinf(x) && isinf(z) && x != z) *_errno() = EDOM;
-  else if (isinf(y) && isinf(z) && y != z) *_errno() = EDOM;
-  return w;
+    union { double f; UINT64 i; } u;
+    double xy, adjust;
+    int e;
+
+    xy = (double)x * y;
+    u.f = xy + z;
+    e = u.i>>52 & 0x7ff;
+    /* Common case: The double precision result is fine. */
+    if ((u.i & 0x1fffffff) != 0x10000000 || /* not a halfway case */
+            e == 0x7ff || /* NaN */
+            (u.f - xy == z && u.f - z == xy) || /* exact */
+            (_controlfp(0, 0) & _MCW_RC) != _RC_NEAR) /* not round-to-nearest */
+    {
+        if (!isnan(x) && !isnan(y) && !isnan(z) && isnan(u.f)) *_errno() = EDOM;
+
+        /* underflow may not be raised correctly, example:
+           fmaf(0x1p-120f, 0x1p-120f, 0x1p-149f) */
+        if (e < 0x3ff-126 && e >= 0x3ff-149 && _statusfp() & _SW_INEXACT)
+            fp_barrierf((float)u.f * (float)u.f);
+        return u.f;
+    }
+
+    /*
+     * If result is inexact, and exactly halfway between two float values,
+     * we need to adjust the low-order bit in the direction of the error.
+     */
+    _controlfp(_RC_CHOP, _MCW_RC);
+    adjust = fp_barrier(xy + z);
+    _controlfp(_RC_NEAR, _MCW_RC);
+    if (u.f == adjust)
+        u.i++;
+    return u.f;
 }
 
 /*********************************************************************
@@ -8647,16 +8676,15 @@ end:
 /* sin(pi*x) assuming x > 2^-100, if sin(pi*x)==0 the sign is arbitrary */
 static double sin_pi(double x)
 {
-    static const double pi = 3.14159265358979311600e+00;
     int n;
 
     /* spurious inexact if odd int */
     x = 2.0 * (x * 0.5 - floor(x * 0.5)); /* x mod 2.0 */
 
-    n = (int)(x * 4.0);
+    n = x * 4.0;
     n = (n + 1) / 2;
     x -= n * 0.5f;
-    x *= pi;
+    x *= M_PI;
 
     switch (n) {
     default: /* case 4: */
@@ -9047,20 +9075,137 @@ float CDECL lgammaf(float x)
     return r;
 }
 
+static double tgamma_S(double x)
+{
+    static const double Snum[] = {
+        23531376880.410759688572007674451636754734846804940,
+        42919803642.649098768957899047001988850926355848959,
+        35711959237.355668049440185451547166705960488635843,
+        17921034426.037209699919755754458931112671403265390,
+        6039542586.3520280050642916443072979210699388420708,
+        1439720407.3117216736632230727949123939715485786772,
+        248874557.86205415651146038641322942321632125127801,
+        31426415.585400194380614231628318205362874684987640,
+        2876370.6289353724412254090516208496135991145378768,
+        186056.26539522349504029498971604569928220784236328,
+        8071.6720023658162106380029022722506138218516325024,
+        210.82427775157934587250973392071336271166969580291,
+        2.5066282746310002701649081771338373386264310793408,
+    };
+    static const double Sden[] = {
+        0, 39916800, 120543840, 150917976, 105258076, 45995730, 13339535,
+        2637558, 357423, 32670, 1925, 66, 1,
+    };
+
+    double num = 0, den = 0;
+    int i;
+
+    /* to avoid overflow handle large x differently */
+    if (x < 8)
+        for (i = ARRAY_SIZE(Snum) - 1; i >= 0; i--) {
+            num = num * x + Snum[i];
+            den = den * x + Sden[i];
+        }
+    else
+        for (i = 0; i < ARRAY_SIZE(Snum); i++) {
+            num = num / x + Snum[i];
+            den = den / x + Sden[i];
+        }
+    return num / den;
+}
+
 /*********************************************************************
  *      tgamma (MSVCR120.@)
+ *
+ * Copied from musl: src/math/tgamma.c
  */
 double CDECL tgamma(double x)
 {
-    return unix_funcs->tgamma( x );
+    static const double gmhalf = 5.524680040776729583740234375;
+    static const double fact[] = {
+        1, 1, 2, 6, 24, 120, 720, 5040.0, 40320.0, 362880.0, 3628800.0, 39916800.0,
+        479001600.0, 6227020800.0, 87178291200.0, 1307674368000.0, 20922789888000.0,
+        355687428096000.0, 6402373705728000.0, 121645100408832000.0,
+        2432902008176640000.0, 51090942171709440000.0, 1124000727777607680000.0,
+    };
+
+    union {double f; UINT64 i;} u = {x};
+    double absx, y, dy, z, r;
+    UINT32 ix = u.i >> 32 & 0x7fffffff;
+    int sign = u.i >> 63;
+
+    /* special cases */
+    if (ix >= 0x7ff00000) {
+        /* tgamma(nan)=nan, tgamma(inf)=inf, tgamma(-inf)=nan with invalid */
+        if (u.i == 0xfff0000000000000ULL)
+            *_errno() = EDOM;
+        return x + INFINITY;
+    }
+    if (ix < (0x3ff - 54) << 20) {
+        /* |x| < 2^-54: tgamma(x) ~ 1/x, +-0 raises div-by-zero */
+        if (x == 0.0)
+            *_errno() = ERANGE;
+        return 1 / x;
+    }
+
+    /* integer arguments */
+    /* raise inexact when non-integer */
+    if (x == floor(x)) {
+        if (sign) {
+            *_errno() = EDOM;
+            return 0 / (x - x);
+        }
+        if (x <= ARRAY_SIZE(fact))
+            return fact[(int)x - 1];
+    }
+
+    /* x >= 172: tgamma(x)=inf with overflow */
+    /* x =< -184: tgamma(x)=+-0 with underflow */
+    if (ix >= 0x40670000) { /* |x| >= 184 */
+        *_errno() = ERANGE;
+        if (sign) {
+            fp_barrierf(0x1p-126 / x);
+            return 0;
+        }
+        x *= 0x1p1023;
+        return x;
+    }
+
+    absx = sign ? -x : x;
+
+    /* handle the error of x + g - 0.5 */
+    y = absx + gmhalf;
+    if (absx > gmhalf) {
+        dy = y - absx;
+        dy -= gmhalf;
+    } else {
+        dy = y - gmhalf;
+        dy -= absx;
+    }
+
+    z = absx - 0.5;
+    r = tgamma_S(absx) * exp(-y);
+    if (x < 0) {
+        /* reflection formula for negative x */
+        /* sinpi(absx) is not 0, integers are already handled */
+        r = -M_PI / (sin_pi(absx) * absx * r);
+        dy = -dy;
+        z = -z;
+    }
+    r += dy * (gmhalf + 0.5) * r / y;
+    z = pow(y, 0.5 * z);
+    y = r * z * z;
+    return y;
 }
 
 /*********************************************************************
  *      tgammaf (MSVCR120.@)
+ *
+ * Copied from musl: src/math/tgammaf.c
  */
 float CDECL tgammaf(float x)
 {
-    return unix_funcs->tgammaf( x );
+    return tgamma(x);
 }
 
 /*********************************************************************

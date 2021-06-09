@@ -27,11 +27,8 @@ struct unix_funcs
     float           (CDECL *expf)(float x);
     double          (CDECL *exp2)(double x);
     float           (CDECL *exp2f)(float x);
-    float           (CDECL *fmaf)(float x, float y, float z);
     double          (CDECL *pow)(double x, double y);
     float           (CDECL *powf)(float x, float y);
-    double          (CDECL *tgamma)(double x);
-    float           (CDECL *tgammaf)(float x);
 };
 
 #endif /* __UNIXLIB_H */

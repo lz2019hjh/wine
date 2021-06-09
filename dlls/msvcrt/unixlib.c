@@ -83,18 +83,6 @@ static float CDECL unix_exp2f( float x )
 }
 
 /*********************************************************************
- *      fmaf
- */
-static float CDECL unix_fmaf( float x, float y, float z )
-{
-#ifdef HAVE_FMAF
-    return fmaf(x, y, z);
-#else
-    return x * y + z;
-#endif
-}
-
-/*********************************************************************
  *      pow
  */
 static double CDECL unix_pow( double x, double y )
@@ -110,43 +98,14 @@ static float CDECL unix_powf( float x, float y )
     return powf( x, y );
 }
 
-/*********************************************************************
- *      tgamma
- */
-static double CDECL unix_tgamma(double x)
-{
-#ifdef HAVE_TGAMMA
-    return tgamma(x);
-#else
-    FIXME( "not implemented\n" );
-    return 0;
-#endif
-}
-
-/*********************************************************************
- *      tgammaf
- */
-static float CDECL unix_tgammaf(float x)
-{
-#ifdef HAVE_TGAMMAF
-    return tgammaf(x);
-#else
-    FIXME( "not implemented\n" );
-    return 0;
-#endif
-}
-
 static const struct unix_funcs funcs =
 {
     unix_exp,
     unix_expf,
     unix_exp2,
     unix_exp2f,
-    unix_fmaf,
     unix_pow,
     unix_powf,
-    unix_tgamma,
-    unix_tgammaf,
 };
 
 NTSTATUS CDECL __wine_init_unix_lib( HMODULE module, DWORD reason, const void *ptr_in, void *ptr_out )

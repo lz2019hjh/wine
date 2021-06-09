@@ -40,11 +40,6 @@
 # define sipx_node       sipx_addr.x_host.c_host
 #endif  /* __FreeBSD__ */
 
-#if !defined(TCP_KEEPIDLE) && defined(TCP_KEEPALIVE)
-/* TCP_KEEPALIVE is the Mac OS name for TCP_KEEPIDLE */
-#define TCP_KEEPIDLE TCP_KEEPALIVE
-#endif
-
 #define FILE_USE_FILE_POINTER_POSITION ((LONGLONG)-2)
 
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
@@ -1975,62 +1970,65 @@ static int WINAPI WS2_WSARecvMsg( SOCKET s, LPWSAMSG msg, LPDWORD lpNumberOfByte
  */
 static BOOL interface_bind( SOCKET s, int fd, struct sockaddr *addr )
 {
+#if defined(HAVE_GETIFADDRS) && (defined(IP_BOUND_IF) || defined(LINUX_BOUND_IF))
     struct sockaddr_in *in_sock = (struct sockaddr_in *) addr;
     in_addr_t bind_addr = in_sock->sin_addr.s_addr;
-    PIP_ADAPTER_INFO adapters = NULL, adapter;
+    struct ifaddrs *ifaddrs, *ifaddr;
+    unsigned int index;
     BOOL ret = FALSE;
-    DWORD adap_size;
     int enable = 1;
 
     if (bind_addr == htonl(INADDR_ANY) || bind_addr == htonl(INADDR_LOOPBACK))
         return FALSE; /* Not binding to a network adapter, special interface binding unnecessary. */
     if (_get_fd_type(fd) != SOCK_DGRAM)
         return FALSE; /* Special interface binding is only necessary for UDP datagrams. */
-    if (GetAdaptersInfo(NULL, &adap_size) != ERROR_BUFFER_OVERFLOW)
-        goto cleanup;
-    adapters = HeapAlloc(GetProcessHeap(), 0, adap_size);
-    if (adapters == NULL || GetAdaptersInfo(adapters, &adap_size) != NO_ERROR)
-        goto cleanup;
-    /* Search the IPv4 adapter list for the appropriate binding interface */
-    for (adapter = adapters; adapter != NULL; adapter = adapter->Next)
-    {
-        in_addr_t adapter_addr = (in_addr_t) inet_addr(adapter->IpAddressList.IpAddress.String);
 
-        if (bind_addr == adapter_addr)
+    if (getifaddrs( &ifaddrs ) < 0) return FALSE;
+
+    for (ifaddr = ifaddrs; ifaddr != NULL; ifaddr = ifaddr->ifa_next)
+    {
+        if (ifaddr->ifa_addr && ifaddr->ifa_addr->sa_family == AF_INET
+                && ((struct sockaddr_in *)ifaddr->ifa_addr)->sin_addr.s_addr == bind_addr)
         {
+            index = if_nametoindex( ifaddr->ifa_name );
+            if (!index)
+            {
+                ERR( "Unable to look up interface index for %s: %s\n", ifaddr->ifa_name, strerror( errno ) );
+                continue;
+            }
+
 #if defined(IP_BOUND_IF)
             /* IP_BOUND_IF sets both the incoming and outgoing restriction at once */
-            if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &adapter->Index, sizeof(adapter->Index)) != 0)
+            if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index)) != 0)
                 goto cleanup;
             ret = TRUE;
 #elif defined(LINUX_BOUND_IF)
-            in_addr_t ifindex = (in_addr_t) htonl(adapter->Index);
-            struct interface_filter specific_interface_filter;
-            struct sock_fprog filter_prog;
+            {
+                in_addr_t ifindex = (in_addr_t) htonl(index);
+                struct interface_filter specific_interface_filter;
+                struct sock_fprog filter_prog;
 
-            if (setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex, sizeof(ifindex)) != 0)
-                goto cleanup; /* Failed to suggest egress interface */
-            specific_interface_filter = generic_interface_filter;
-            specific_interface_filter.iface_rule.k = adapter->Index;
-            specific_interface_filter.ip_rule.k = htonl(adapter_addr);
-            filter_prog.len = sizeof(generic_interface_filter)/sizeof(struct sock_filter);
-            filter_prog.filter = (struct sock_filter *) &specific_interface_filter;
-            if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &filter_prog, sizeof(filter_prog)) != 0)
-                goto cleanup; /* Failed to specify incoming packet filter */
-            ret = TRUE;
-#else
-            FIXME("Broadcast packets on interface-bound sockets are not currently supported on this platform, "
-                  "receiving broadcast packets will not work on socket %04lx.\n", s);
+                if (setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex, sizeof(ifindex)) != 0)
+                    goto cleanup; /* Failed to suggest egress interface */
+                specific_interface_filter = generic_interface_filter;
+                specific_interface_filter.iface_rule.k = index;
+                specific_interface_filter.ip_rule.k = htonl(bind_addr);
+                filter_prog.len = sizeof(generic_interface_filter)/sizeof(struct sock_filter);
+                filter_prog.filter = (struct sock_filter *) &specific_interface_filter;
+                if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &filter_prog, sizeof(filter_prog)) != 0)
+                    goto cleanup; /* Failed to specify incoming packet filter */
+                ret = TRUE;
+            }
 #endif
             if (ret)
             {
                 EnterCriticalSection(&cs_if_addr_cache);
-                if (if_addr_cache_size <= adapter->Index)
+                if (if_addr_cache_size <= index)
                 {
                     unsigned int new_size;
                     in_addr_t *new;
 
-                    new_size = max(if_addr_cache_size * 2, adapter->Index + 1);
+                    new_size = max(if_addr_cache_size * 2, index + 1);
                     if (!(new = heap_realloc(if_addr_cache, sizeof(*if_addr_cache) * new_size)))
                     {
                         ERR("No memory.\n");
@@ -2043,10 +2041,10 @@ static BOOL interface_bind( SOCKET s, int fd, struct sockaddr *addr )
                     if_addr_cache = new;
                     if_addr_cache_size = new_size;
                 }
-                if (if_addr_cache[adapter->Index] && if_addr_cache[adapter->Index] != adapter_addr)
-                    WARN("Adapter addr for iface index %u has changed.\n", adapter->Index);
+                if (if_addr_cache[index] && if_addr_cache[index] != bind_addr)
+                    WARN("Adapter addr for iface index %u has changed.\n", index);
 
-                if_addr_cache[adapter->Index] = adapter_addr;
+                if_addr_cache[index] = bind_addr;
                 LeaveCriticalSection(&cs_if_addr_cache);
             }
             break;
@@ -2054,15 +2052,19 @@ static BOOL interface_bind( SOCKET s, int fd, struct sockaddr *addr )
     }
     /* Will soon be switching to INADDR_ANY: permit address reuse */
     if (ret && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == 0)
-        TRACE("Socket %04lx bound to interface index %d\n", s, adapter->Index);
+        TRACE("Socket %04lx bound to interface index %d\n", s, index);
     else
         ret = FALSE;
 
 cleanup:
     if(!ret)
         ERR("Failed to bind to interface, receiving broadcast packets will not work on socket %04lx.\n", s);
-    HeapFree(GetProcessHeap(), 0, adapters);
+    freeifaddrs( ifaddrs );
     return ret;
+#else
+    FIXME( "Broadcast packets on interface-bound sockets are not currently supported on this platform.\n" );
+    return FALSE;
+#endif
 }
 
 /***********************************************************************
@@ -3181,6 +3183,10 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
         if (!((ULONG_PTR)overlapped->hEvent & 1)) cvalue = overlapped;
         event = overlapped->hEvent;
     }
+    else
+    {
+        if (!(event = get_sync_event())) return GetLastError();
+    }
 
     if (completion)
     {
@@ -3191,6 +3197,12 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
 
     status = NtDeviceIoControlFile( handle, event, apc, cvalue, piosb, code,
                                     in_buff, in_size, out_buff, out_size );
+    if (status == STATUS_PENDING && !overlapped)
+    {
+        if (WaitForSingleObject( event, INFINITE ) == WAIT_FAILED)
+            return -1;
+        status = piosb->u.Status;
+    }
     if (status == STATUS_NOT_SUPPORTED)
     {
         FIXME("Unsupported ioctl %x (device=%x access=%x func=%x method=%x)\n",
@@ -3202,122 +3214,6 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
     return NtStatusToWSAError( status );
 }
 
-static DWORD get_interface_list(SOCKET s, void *out_buff, DWORD out_size, DWORD *ret_size, DWORD *total_bytes)
-{
-    DWORD size, interface_count = 0, ret;
-    INTERFACE_INFO *info = out_buff;
-    PMIB_IPADDRTABLE table = NULL;
-    struct if_nameindex *if_ni;
-    DWORD status = 0;
-    int fd;
-
-    if (!out_buff)
-        return WSAEFAULT;
-
-    if ((fd = get_sock_fd(s, 0, NULL)) == -1)
-        return SOCKET_ERROR;
-
-    if ((ret = GetIpAddrTable(NULL, &size, TRUE)) != ERROR_INSUFFICIENT_BUFFER)
-    {
-        if (ret != ERROR_NO_DATA)
-        {
-            ERR("Unable to get ip address table.\n");
-            status = WSAEINVAL;
-        }
-        goto done;
-    }
-    if (!(table = heap_alloc(size)))
-    {
-        ERR("No memory.\n");
-        status = WSAEINVAL;
-        goto done;
-    }
-    if (GetIpAddrTable(table, &size, TRUE) != NO_ERROR)
-    {
-        ERR("Unable to get interface table.\n");
-        status = WSAEINVAL;
-        goto done;
-    }
-    if (table->dwNumEntries * sizeof(INTERFACE_INFO) > out_size)
-    {
-        WARN("Buffer too small, dwNumEntries %u, out_size = %u.\n", table->dwNumEntries, out_size);
-        *ret_size = 0;
-        status = WSAEFAULT;
-        goto done;
-    }
-
-    if (!(if_ni = if_nameindex()))
-    {
-        ERR("Unable to get interface name index.\n");
-        status = WSAEINVAL;
-        goto done;
-    }
-
-    for (; interface_count < table->dwNumEntries; ++interface_count, ++info)
-    {
-        unsigned int addr, mask;
-        struct ifreq if_info;
-        unsigned int i;
-
-        memset(info, 0, sizeof(*info));
-
-        for (i = 0; if_ni[i].if_index || if_ni[i].if_name; ++i)
-            if (if_ni[i].if_index == table->table[interface_count].dwIndex)
-                break;
-
-        if (!if_ni[i].if_name)
-        {
-            ERR("Error obtaining interface name for ifindex %u.\n", table->table[interface_count].dwIndex);
-            status = WSAEINVAL;
-            break;
-        }
-
-        lstrcpynA(if_info.ifr_name, if_ni[i].if_name, IFNAMSIZ);
-        if (ioctl(fd, SIOCGIFFLAGS, &if_info) < 0)
-        {
-            ERR("Error obtaining status flags for socket.\n");
-            status = WSAEINVAL;
-            break;
-        }
-
-        if (if_info.ifr_flags & IFF_BROADCAST)
-            info->iiFlags |= WS_IFF_BROADCAST;
-#ifdef IFF_POINTOPOINT
-        if (if_info.ifr_flags & IFF_POINTOPOINT)
-            info->iiFlags |= WS_IFF_POINTTOPOINT;
-#endif
-        if (if_info.ifr_flags & IFF_LOOPBACK)
-            info->iiFlags |= WS_IFF_LOOPBACK;
-        if (if_info.ifr_flags & IFF_UP)
-            info->iiFlags |= WS_IFF_UP;
-        if (if_info.ifr_flags & IFF_MULTICAST)
-            info->iiFlags |= WS_IFF_MULTICAST;
-
-        addr = table->table[interface_count].dwAddr;
-        mask = table->table[interface_count].dwMask;
-
-        info->iiAddress.AddressIn.sin_family = WS_AF_INET;
-        info->iiAddress.AddressIn.sin_port = 0;
-        info->iiAddress.AddressIn.sin_addr.WS_s_addr = addr;
-
-        info->iiNetmask.AddressIn.sin_family = WS_AF_INET;
-        info->iiNetmask.AddressIn.sin_port = 0;
-        info->iiNetmask.AddressIn.sin_addr.WS_s_addr = mask;
-
-        if (if_info.ifr_flags & IFF_BROADCAST)
-        {
-            info->iiBroadcastAddress.AddressIn.sin_family = WS_AF_INET;
-            info->iiBroadcastAddress.AddressIn.sin_port = 0;
-            info->iiBroadcastAddress.AddressIn.sin_addr.WS_s_addr = addr | ~mask;
-        }
-    }
-    if_freenameindex(if_ni);
-done:
-    heap_free(table);
-    *total_bytes = sizeof(INTERFACE_INFO) * interface_count;
-    release_sock_fd(s, fd);
-    return status;
-}
 
 /**********************************************************************
  *              WSAIoctl                (WS2_32.50)
@@ -3327,7 +3223,6 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
                     DWORD out_size, LPDWORD ret_size, LPWSAOVERLAPPED overlapped,
                     LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
 {
-    int fd;
     DWORD status = 0, total = 0;
 
     TRACE("%04lx, %s, %p, %d, %p, %d, %p, %p, %p\n",
@@ -3351,8 +3246,10 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
             return -1;
         }
 
+        /* Explicitly ignore the output buffer; WeChat tries to pass an address
+         * without write access. */
         ret = server_ioctl_sock( s, IOCTL_AFD_WINE_FIONBIO, in_buff, in_size,
-                                 out_buff, out_size, ret_size, overlapped, completion );
+                                 NULL, 0, ret_size, overlapped, completion );
         SetLastError( ret );
         return ret ? -1 : 0;
     }
@@ -3384,16 +3281,19 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
         SetLastError(WSAEINVAL);
         return SOCKET_ERROR;
 
-   case WS_SIO_GET_INTERFACE_LIST:
-       {
-           TRACE("-> SIO_GET_INTERFACE_LIST request\n");
+    case WS_SIO_GET_INTERFACE_LIST:
+    {
+        DWORD ret;
 
-           status = get_interface_list(s, out_buff, out_size, ret_size, &total);
-           break;
-       }
+        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_GET_INTERFACE_LIST, in_buff, in_size,
+                                 out_buff, out_size, ret_size, overlapped, completion );
+        SetLastError( ret );
+        if (ret && ret != ERROR_IO_PENDING) *ret_size = 0;
+        return ret ? -1 : 0;
+    }
 
-   case WS_SIO_ADDRESS_LIST_QUERY:
-   {
+    case WS_SIO_ADDRESS_LIST_QUERY:
+    {
         DWORD size;
 
         TRACE("-> SIO_ADDRESS_LIST_QUERY request\n");
@@ -3408,17 +3308,19 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
         if (GetAdaptersInfo(NULL, &size) == ERROR_BUFFER_OVERFLOW)
         {
             IP_ADAPTER_INFO *p, *table = HeapAlloc(GetProcessHeap(), 0, size);
+            NTSTATUS status = STATUS_SUCCESS;
             SOCKET_ADDRESS_LIST *sa_list;
             SOCKADDR_IN *sockaddr;
             SOCKET_ADDRESS *sa;
             unsigned int i;
+            DWORD ret = 0;
             DWORD num;
 
             if (!table || GetAdaptersInfo(table, &size))
             {
                 HeapFree(GetProcessHeap(), 0, table);
-                status = WSAEINVAL;
-                break;
+                SetLastError( WSAEINVAL );
+                return -1;
             }
 
             for (p = table, num = 0; p; p = p->Next)
@@ -3429,8 +3331,8 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
             {
                 *ret_size = total;
                 HeapFree(GetProcessHeap(), 0, table);
-                status = WSAEFAULT;
-                break;
+                SetLastError( WSAEFAULT );
+                return -1;
             }
 
             sa_list = out_buff;
@@ -3452,14 +3354,20 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
             }
 
             HeapFree(GetProcessHeap(), 0, table);
+
+            ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                     NULL, 0, ret_size, overlapped, completion );
+            *ret_size = total;
+            SetLastError( ret );
+            return ret ? -1 : 0;
         }
         else
         {
             WARN("unable to get IP address list\n");
-            status = WSAEINVAL;
+            SetLastError( WSAEINVAL );
+            return -1;
         }
-        break;
-   }
+    }
 
     case WS_SIO_FLUSH:
         FIXME("SIO_FLUSH: stub.\n");
@@ -3508,52 +3416,18 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
         SetLastError( WSAEINVAL );
         return -1;
     }
+
     case WS_SIO_KEEPALIVE_VALS:
     {
-        struct tcp_keepalive *k;
-        int keepalive, keepidle, keepintvl;
+        DWORD ret;
 
-        if (!in_buff || in_size < sizeof(struct tcp_keepalive))
-        {
-            SetLastError(WSAEFAULT);
-            return SOCKET_ERROR;
-        }
+        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_KEEPALIVE_VALS, in_buff, in_size,
+                                 out_buff, out_size, ret_size, overlapped, completion );
+        if (!overlapped || completion) *ret_size = 0;
+        SetLastError( ret );
+        return ret ? -1 : 0;
+    }
 
-        k = in_buff;
-        keepalive = k->onoff ? 1 : 0;
-        keepidle = max( 1, (k->keepalivetime + 500) / 1000 );
-        keepintvl = max( 1, (k->keepaliveinterval + 500) / 1000 );
-
-        TRACE("onoff: %d, keepalivetime: %d, keepaliveinterval: %d\n", keepalive, keepidle, keepintvl);
-
-        fd = get_sock_fd(s, 0, NULL);
-        if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(int)) == -1)
-            status = WSAEINVAL;
-#if defined(TCP_KEEPIDLE) || defined(TCP_KEEPINTVL)
-        /* these values need to be set only if SO_KEEPALIVE is enabled */
-        else if(keepalive)
-        {
-#ifndef TCP_KEEPIDLE
-            FIXME("ignoring keepalive timeout\n");
-#else
-            if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (void *)&keepidle, sizeof(int)) == -1)
-                status = WSAEINVAL;
-            else
-#endif
-#ifdef TCP_KEEPINTVL
-            if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (void *)&keepintvl, sizeof(int)) == -1)
-                status = WSAEINVAL;
-#else
-                FIXME("ignoring keepalive interval\n");
-#endif
-        }
-#else
-        else
-            FIXME("ignoring keepalive interval and timeout\n");
-#endif
-        release_sock_fd(s, fd);
-        break;
-   }
    case WS_SIO_ROUTING_INTERFACE_QUERY:
    {
        struct WS_sockaddr *daddr = (struct WS_sockaddr *)in_buff;
@@ -3624,9 +3498,10 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
 
     case WS_SIO_ADDRESS_LIST_CHANGE:
     {
+        int force_async = !!overlapped;
         DWORD ret;
 
-        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_ADDRESS_LIST_CHANGE, in_buff, in_size,
+        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_ADDRESS_LIST_CHANGE, &force_async, sizeof(force_async),
                                  out_buff, out_size, ret_size, overlapped, completion );
         SetLastError( ret );
         return ret ? -1 : 0;

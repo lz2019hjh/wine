@@ -594,6 +594,7 @@ static HRESULT Field_create( const WCHAR *name, LONG index, struct recordset *re
     field->Field_iface.lpVtbl = &field_vtbl;
     field->ISupportErrorInfo_iface.lpVtbl = &field_supporterrorinfo_vtbl;
     field->Properties_iface.lpVtbl = &field_properties_vtbl;
+    field->refs = 1;
     if (!(field->name = strdupW( name )))
     {
         heap_free( field );
@@ -738,6 +739,22 @@ static HRESULT WINAPI fields_Refresh( Fields *iface )
 static HRESULT map_index( struct fields *fields, VARIANT *index, ULONG *ret )
 {
     ULONG i;
+
+    if (V_VT( index ) == VT_I4 || V_VT( index ) == VT_I2)
+    {
+        if (V_VT( index ) == VT_I4)
+            i = V_I4 ( index );
+        else
+            i = V_I2 ( index );
+
+        if (i < fields->count)
+        {
+            *ret = i;
+            return S_OK;
+        }
+
+        return MAKE_ADO_HRESULT(adErrItemNotFound);
+    }
 
     if (V_VT( index ) != VT_BSTR)
     {
@@ -998,6 +1015,7 @@ static ULONG WINAPI recordset_AddRef( _Recordset *iface )
 static void close_recordset( struct recordset *recordset )
 {
     ULONG row, col, col_count;
+    ULONG i;
 
     if ( recordset->row_set ) IRowset_Release( recordset->row_set );
     recordset->row_set = NULL;
@@ -1005,6 +1023,13 @@ static void close_recordset( struct recordset *recordset )
     if (!recordset->fields) return;
     col_count = get_column_count( recordset );
 
+    for (i = 0; i < col_count; i++)
+    {
+        struct field *field = impl_from_Field( recordset->fields->field[i] );
+        field->recordset = NULL;
+        Field_Release(&field->Field_iface);
+    }
+    recordset->fields->count = 0;
     Fields_Release( &recordset->fields->Fields_iface );
     recordset->fields = NULL;
 
